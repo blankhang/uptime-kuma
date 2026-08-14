@@ -1,0 +1,293 @@
+# Fork-only release for blankhang/uptime-kuma (includes Elasticsearch monitor).
+# Secrets:
+#   DOCKER_HUB_USERNAME / DOCKER_HUB_PASSWORD  → Docker Hub
+#   ALI_REGISTRY / ALI_REGISTRY_USERNAME / ALI_REGISTRY_PASSWORD → 阿里云容器镜像服务
+# Trigger:
+#   - push tag matching v*.* (e.g. v2.5.0-es.1)
+#   - workflow_dispatch with version input
+name: Release Fork ES
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without leading v (e.g. 2.5.0-es.1)"
+        required: true
+        type: string
+      create_release:
+        description: "Create GitHub Release with dist.tar.gz"
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: "Build only; do not push images or create a GitHub Release"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*.*"
+
+env:
+  IMAGE_NAME: blankhang/uptime-kuma
+  IMAGE: uptime-kuma
+  TZ: Asia/Shanghai
+
+permissions: {}
+
+jobs:
+  prepare:
+    if: github.repository == 'blankhang/uptime-kuma'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dry_run: ${{ steps.version.outputs.dry_run }}
+      create_release: ${{ steps.version.outputs.create_release }}
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            DRY_RUN="${{ inputs.dry_run }}"
+            CREATE_RELEASE="${{ inputs.create_release }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+            DRY_RUN="false"
+            CREATE_RELEASE="true"
+          fi
+          VERSION="${VERSION#v}"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::VERSION is empty"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+          echo "create_release=${CREATE_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved VERSION=${VERSION} dry_run=${DRY_RUN} create_release=${CREATE_RELEASE}"
+
+  build:
+    if: github.repository == 'blankhang/uptime-kuma'
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm clean-install --no-fund
+
+      - name: Build frontend dist
+        run: npm run build
+
+      - name: Pack dist.tar.gz
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          tar -czf dist.tar.gz dist
+          ls -lh dist.tar.gz
+
+      - name: Upload dist.tar.gz
+        if: matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-tar
+          path: dist.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Set up QEMU
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        if: needs.prepare.outputs.dry_run != 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Build by platform (dry run, no push)
+        if: needs.prepare.outputs.dry_run == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: docker/dockerfile
+          target: release
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=${{ github.workflow }}-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+
+      - name: Build by platform and push by digest
+        if: needs.prepare.outputs.dry_run != 'true'
+        id: docker_build
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: docker/dockerfile
+          target: release
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ github.workflow }}-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: needs.prepare.outputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.docker_build.outputs.digest }}"
+          digest="${digest#sha256:}"
+          touch "/tmp/digests/${digest}"
+
+      - name: Upload digest
+        if: needs.prepare.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    if: github.repository == 'blankhang/uptime-kuma' && needs.prepare.outputs.dry_run != 'true'
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Login to Ali Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ secrets.ALI_REGISTRY }}
+          username: ${{ secrets.ALI_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALI_REGISTRY_PASSWORD }}
+
+      - name: Merge and push Docker Hub multi-arch manifest
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find /tmp/digests -type f)
+          if [ "${#files[@]}" -lt 2 ]; then
+            echo "::error::Expected at least 2 platform digests, got ${#files[@]}"
+            find /tmp/digests -ls || true
+            exit 1
+          fi
+          refs=()
+          for f in "${files[@]}"; do
+            refs+=("${IMAGE}@sha256:$(basename "$f")")
+          done
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            "${refs[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+      - name: Copy multi-arch manifest to Ali Registry
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          SRC="${{ env.IMAGE_NAME }}:${VERSION}"
+          ALI="${{ secrets.ALI_REGISTRY }}/blankhang/${{ env.IMAGE }}"
+          docker buildx imagetools create \
+            --tag "${ALI}:${VERSION}" \
+            --tag "${ALI}:latest" \
+            "${SRC}"
+          docker buildx imagetools inspect "${ALI}:${VERSION}"
+
+  github-release:
+    if: >-
+      github.repository == 'blankhang/uptime-kuma'
+      && needs.prepare.outputs.dry_run != 'true'
+      && needs.prepare.outputs.create_release == 'true'
+    needs:
+      - prepare
+      - build
+      - merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download dist.tar.gz
+        uses: actions/download-artifact@v7
+        with:
+          name: dist-tar
+          path: .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: v${{ needs.prepare.outputs.version }}
+          generate_release_notes: true
+          files: dist.tar.gz
+          body: |
+            Fork release of Uptime Kuma with **Elasticsearch cluster monitor** support.
+
+            ## Docker
+
+            ```bash
+            docker pull blankhang/uptime-kuma:${{ needs.prepare.outputs.version }}
+            # or
+            docker pull blankhang/uptime-kuma:latest
+            ```
+
+            Multi-arch manifest is also copied to the configured Aliyun registry as `blankhang/uptime-kuma`.
+
+            ## Notes
+
+            - Based on this fork branch with Elasticsearch monitoring.
+            - Not an official louislam/uptime-kuma release.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
