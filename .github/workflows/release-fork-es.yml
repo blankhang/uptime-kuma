@@ -153,6 +153,8 @@ jobs:
           file: docker/dockerfile
           target: release
           platforms: ${{ matrix.platform }}
+          provenance: false
+          sbom: false
           cache-from: type=gha,scope=${{ github.workflow }}-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
